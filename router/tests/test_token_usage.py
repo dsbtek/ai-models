@@ -176,3 +176,51 @@ async def test_apply_migrations_runs_pending_in_order_and_skips_applied(tmp_path
     assert "CREATE TABLE t2 (id INT);" in conn.executed
     assert "CREATE TABLE t1 (id INT);" not in conn.executed
     assert conn.executed[-1].startswith("SELECT pg_advisory_unlock")
+
+
+@pytest.mark.asyncio
+async def test_zero_memory_skips_embedding_and_uses_lru_cache_and_cache_prompt():
+    app, upstream_calls = build_test_app(auth_mode="dev")
+    async with LifespanManager(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8080") as client:
+            upstream_calls.clear()
+
+            # 1. User has 0 memories -> should NOT hit /v1/embeddings during chat recall
+            r1 = await client.post(
+                "/v1/chat/completions",
+                headers={"X-App-Id": "fast-app", "X-User-Id": "new-user"},
+                json={"model": "coder", "messages": [{"role": "user", "content": "Fast turn"}]},
+            )
+            assert r1.status_code == 200
+            assert "x-router-prep-ms" in r1.headers
+            embed_calls = [c for c in upstream_calls if c["path"] == "/v1/embeddings"]
+            chat_calls = [c for c in upstream_calls if c["path"] == "/v1/chat/completions"]
+            assert len(embed_calls) == 0
+            assert len(chat_calls) == 1
+            assert chat_calls[0]["body"].get("cache_prompt") is True
+
+            # 2. Store a memory for new-user (1 embedding call)
+            r_mem = await client.post(
+                "/v1/memories",
+                headers={"X-App-Id": "fast-app", "X-User-Id": "new-user"},
+                json={"category": "preference", "content": "Uses Python 3.12 and FastAPI"},
+            )
+            assert r_mem.status_code == 201
+            upstream_calls.clear()
+
+            # 3. Chat turn with same text twice -> first embeds, second hits EmbeddingClient LRU cache
+            for _ in range(2):
+                r_chat = await client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-App-Id": "fast-app",
+                        "X-User-Id": "new-user",
+                        "X-Memory-Mode": "read_only",
+                    },
+                    json={"model": "coder", "messages": [{"role": "user", "content": "Repeated query text"}]},
+                )
+                assert r_chat.status_code == 200
+
+            embed_calls_after = [c for c in upstream_calls if c["path"] == "/v1/embeddings"]
+            assert len(embed_calls_after) == 1

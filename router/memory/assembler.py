@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 import logging
 from typing import Any
@@ -167,26 +168,54 @@ class ContextAssembler:
         if budget.clamped_max_tokens is not None:
             payload["max_tokens"] = budget.clamped_max_tokens
 
-        # 1. Load session state & unsummarized messages (if session_id is active)
+        # 1. Load session state & check if user has active memories concurrently
         rolling_summary = ""
         stored_unsummarized: list[dict[str, Any]] = []
-        if scope.session_id and scope.user_id and scope.memory_mode != "off":
+        should_check_memories = bool(
+            scope.user_id
+            and latest_user_text
+            and scope.memory_mode in {"auto", "read_only"}
+        )
+
+        async def _load_session_state() -> tuple[str, list[dict[str, Any]]]:
+            if not (scope.session_id and scope.user_id and scope.memory_mode != "off"):
+                return "", []
             try:
                 session = await self.session_repo.get_session(
                     scope.app_id, scope.user_id, scope.session_id
                 )
-                if session:
-                    rolling_summary = (session.get("rolling_summary") or "").strip()
-                    up_to_seq = int(session.get("summary_up_to_seq") or 0)
-                    stored_unsummarized = await self.session_repo.get_messages(
-                        scope.app_id,
-                        scope.user_id,
-                        scope.session_id,
-                        after_seq=up_to_seq,
-                        limit=120,
-                    )
+                if not session:
+                    return "", []
+                summary = (session.get("rolling_summary") or "").strip()
+                up_to_seq = int(session.get("summary_up_to_seq") or 0)
+                msgs = await self.session_repo.get_messages(
+                    scope.app_id,
+                    scope.user_id,
+                    scope.session_id,
+                    after_seq=up_to_seq,
+                    limit=120,
+                )
+                return summary, msgs
             except Exception as exc:
                 logger.warning("Session lookup failed, continuing gracefully: %s", exc)
+                return "", []
+
+        async def _check_has_memories() -> bool:
+            if not should_check_memories or not scope.user_id:
+                return False
+            checker = getattr(self.memory_repo, "has_active_memories", None)
+            if checker is None:
+                return True
+            try:
+                return bool(await checker(scope.app_id, scope.user_id))
+            except Exception as exc:
+                logger.warning("Memory presence check failed: %s", exc)
+                return True
+
+        (rolling_summary, stored_unsummarized), user_has_memories = await asyncio.gather(
+            _load_session_state(),
+            _check_has_memories(),
+        )
 
         prior_history, new_to_persist = reconcile_client_messages(
             stored_unsummarized, caller_conv
@@ -199,18 +228,16 @@ class ContextAssembler:
             else ([caller_conv[-1]] if caller_conv else [])
         )
 
-        # 2. Retrieve top-K semantic user memories (if user_id is present and mode permits)
+        # 2. Retrieve top-K semantic user memories ONLY when user has active memories
         retrieved_memories: list[dict[str, Any]] = []
-        if (
-            scope.user_id
-            and latest_user_text
-            and scope.memory_mode in {"auto", "read_only"}
-        ):
+        if should_check_memories and user_has_memories and scope.user_id:
             query_vec = await self.embedder.embed_text(
                 latest_user_text, raise_on_error=False
             )
             if query_vec is not None:
-                if self.usage_repo is not None:
+                if self.usage_repo is not None and not getattr(
+                    self.embedder, "last_cache_hit", False
+                ):
                     try:
                         tok = estimate_tokens(latest_user_text)
                         await self.usage_repo.record_usage(

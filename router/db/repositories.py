@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import re
 import secrets
+import time
 from typing import Any
 import uuid
 
@@ -127,10 +128,22 @@ def _record_to_memory(row: Any) -> dict[str, Any]:
 
 
 class AppRepository:
-    """Manage integrated application registrations and SHA-256 API keys."""
+    """Manage integrated application registrations and SHA-256 API keys with in-memory TTL caching."""
+
+    CACHE_TTL_SECONDS = 30.0
+    MAX_CACHE_ENTRIES = 512
 
     def __init__(self, db: DatabaseManager) -> None:
         self.db = db
+        self._key_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+        self._sandbox_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    def _invalidate_caches(self, app_id: str | None = None) -> None:
+        self._key_cache.clear()
+        if app_id is None:
+            self._sandbox_cache.clear()
+        else:
+            self._sandbox_cache.pop(app_id, None)
 
     async def create_app(
         self,
@@ -169,10 +182,16 @@ class AppRepository:
                 prefix,
                 settings or {},
             )
+        self._invalidate_caches(app_id)
         return _record_to_app(row), raw_key
 
     async def ensure_sandbox_app(self, app_id: str) -> dict[str, Any]:
         """Auto-provision an unauthenticated dev-mode app ONLY if not claimed by a registered key."""
+        now_mono = time.monotonic()
+        cached = self._sandbox_cache.get(app_id)
+        if cached is not None and cached[0] > now_mono:
+            return dict(cached[1])
+
         pool = await self.db.ensure_pool()
         async with pool.acquire() as conn:
             existing = await conn.fetchrow("SELECT * FROM apps WHERE app_id = $1", app_id)
@@ -183,7 +202,11 @@ class AppRepository:
                     )
                 if not existing["is_active"]:
                     raise PermissionError(f"App '{app_id}' is deactivated")
-                return _record_to_app(existing)
+                rec = _record_to_app(existing)
+                if len(self._sandbox_cache) >= self.MAX_CACHE_ENTRIES:
+                    self._sandbox_cache.clear()
+                self._sandbox_cache[app_id] = (now_mono + self.CACHE_TTL_SECONDS, rec)
+                return rec
 
             row = await conn.fetchrow(
                 """
@@ -202,7 +225,11 @@ class AppRepository:
                     raise PermissionError(
                         f"App '{app_id}' is a registered key-protected app"
                     )
-            return _record_to_app(row)
+            rec = _record_to_app(row)
+            if len(self._sandbox_cache) >= self.MAX_CACHE_ENTRIES:
+                self._sandbox_cache.clear()
+            self._sandbox_cache[app_id] = (now_mono + self.CACHE_TTL_SECONDS, rec)
+            return rec
 
     async def get_app(self, app_id: str) -> dict[str, Any] | None:
         pool = await self.db.ensure_pool()
@@ -221,13 +248,22 @@ class AppRepository:
 
     async def verify_api_key(self, raw_key: str) -> dict[str, Any] | None:
         key_hash = hash_api_key(raw_key)
+        now_mono = time.monotonic()
+        cached = self._key_cache.get(key_hash)
+        if cached is not None and cached[0] > now_mono:
+            return dict(cached[1]) if cached[1] is not None else None
+
         pool = await self.db.ensure_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM apps WHERE api_key_hash = $1",
                 key_hash,
             )
-            return _record_to_app(row) if row else None
+            rec = _record_to_app(row) if row else None
+            if len(self._key_cache) >= self.MAX_CACHE_ENTRIES:
+                self._key_cache.clear()
+            self._key_cache[key_hash] = (now_mono + self.CACHE_TTL_SECONDS, rec)
+            return dict(rec) if rec is not None else None
 
     async def list_apps(self) -> list[dict[str, Any]]:
         pool = await self.db.ensure_pool()
@@ -263,6 +299,7 @@ class AppRepository:
             )
             if row is None:
                 return None
+            self._invalidate_caches(app_id)
             return _record_to_app(row), raw_key
 
     async def delete_or_deactivate(self, app_id: str, hard: bool = False) -> bool:
@@ -270,6 +307,7 @@ class AppRepository:
         async with pool.acquire() as conn:
             if hard:
                 status = await conn.execute("DELETE FROM apps WHERE app_id = $1", app_id)
+                self._invalidate_caches(app_id)
                 return status.endswith("1")
             row = await conn.fetchrow(
                 """
@@ -280,6 +318,7 @@ class AppRepository:
                 """,
                 app_id,
             )
+            self._invalidate_caches(app_id)
             return row is not None
 
 
@@ -571,8 +610,49 @@ class SessionRepository:
 class MemoryRepository:
     """Strictly (app_id, user_id)-scoped long-term semantic user memory store."""
 
+    PRESENCE_TTL_SECONDS = 30.0
+    MAX_PRESENCE_CACHE = 1024
+
     def __init__(self, db: DatabaseManager) -> None:
         self.db = db
+        self._presence_cache: dict[tuple[str, str], tuple[float, bool]] = {}
+
+    def _set_presence(self, app_id: str, user_id: str, has_memories: bool) -> None:
+        if len(self._presence_cache) >= self.MAX_PRESENCE_CACHE:
+            self._presence_cache.clear()
+        self._presence_cache[(app_id, user_id)] = (
+            time.monotonic() + self.PRESENCE_TTL_SECONDS,
+            has_memories,
+        )
+
+    def _invalidate_presence(self, app_id: str, user_id: str) -> None:
+        self._presence_cache.pop((app_id, user_id), None)
+
+    async def has_active_memories(self, app_id: str, user_id: str) -> bool:
+        """Fast check whether (app_id, user_id) has any active memories to avoid unnecessary embedding calls."""
+        now_mono = time.monotonic()
+        cached = self._presence_cache.get((app_id, user_id))
+        if cached is not None and cached[0] > now_mono:
+            return cached[1]
+
+        pool = await self.db.ensure_pool()
+        async with pool.acquire() as conn:
+            exists = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM user_memories
+                    WHERE app_id = $1
+                      AND user_id = $2
+                      AND is_active = TRUE
+                      AND (expires_at IS NULL OR expires_at > NOW())
+                )
+                """,
+                app_id,
+                user_id,
+            )
+            result = bool(exists)
+            self._set_presence(app_id, user_id, result)
+            return result
 
     async def search_memories(
         self,
@@ -684,6 +764,7 @@ class MemoryRepository:
                         imp,
                         confidence,
                     )
+                    self._set_presence(app_id, user_id, True)
                     return _record_to_memory(updated), "deduplicated"
 
                 # 2. Nearest semantic neighbor check within (app_id, user_id)
@@ -720,7 +801,8 @@ class MemoryRepository:
                             imp,
                             confidence,
                         )
-                        return _record_to_memory(updated), "deduplicated"
+                        self._set_presence(app_id, user_id, True)
+                    return _record_to_memory(updated), "deduplicated"
 
                     if 0.78 <= sim < 0.90 and nearest["category"] == cat:
                         inserted = await conn.fetchrow(
@@ -757,6 +839,7 @@ class MemoryRepository:
                             user_id,
                             inserted["memory_id"],
                         )
+                        self._set_presence(app_id, user_id, True)
                         return _record_to_memory(inserted), "superseded"
 
                 inserted = await conn.fetchrow(
@@ -797,6 +880,7 @@ class MemoryRepository:
                     user_id,
                     max_memories,
                 )
+                self._set_presence(app_id, user_id, True)
                 return _record_to_memory(inserted), "created"
 
     async def list_memories(
@@ -892,6 +976,7 @@ class MemoryRepository:
                 is_active,
                 metadata,
             )
+            self._invalidate_presence(app_id, user_id)
             return _record_to_memory(row) if row else None
 
     async def delete_memory(self, app_id: str, user_id: str, memory_id: str) -> bool:
@@ -904,6 +989,7 @@ class MemoryRepository:
                 user_id,
                 mem_uuid,
             )
+            self._invalidate_presence(app_id, user_id)
             return status.endswith("1")
 
     async def wipe_user_data(self, app_id: str, user_id: str) -> dict[str, int]:
@@ -920,6 +1006,7 @@ class MemoryRepository:
                     app_id,
                     user_id,
                 )
+                self._set_presence(app_id, user_id, False)
                 deleted_memories = int(mem_status.split()[-1]) if mem_status else 0
                 deleted_sessions = int(sess_status.split()[-1]) if sess_status else 0
                 return {
@@ -936,6 +1023,7 @@ class MemoryRepository:
             s_stat = await conn.execute(
                 "DELETE FROM sessions WHERE expires_at IS NOT NULL AND expires_at <= NOW()"
             )
+            self._presence_cache.clear()
             return {
                 "expired_memories": int(m_stat.split()[-1]) if m_stat else 0,
                 "expired_sessions": int(s_stat.split()[-1]) if s_stat else 0,

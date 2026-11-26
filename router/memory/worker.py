@@ -297,6 +297,7 @@ class MemoryWorker:
                     ],
                     "temperature": 0.1,
                     "max_tokens": 200,
+                    "cache_prompt": True,
                 },
                 timeout=45.0,
             )
@@ -366,6 +367,7 @@ class MemoryWorker:
                 ],
                 "temperature": 0.0,
                 "max_tokens": 220,
+                "cache_prompt": True,
             },
             timeout=45.0,
         )
@@ -404,15 +406,16 @@ class MemoryWorker:
             vec = await self.embedder.embed_text(content, raise_on_error=False)
             if vec is None:
                 continue
-            await self._record_usage(
-                app_id=job.app_id,
-                user_id=job.user_id,
-                model_id=self.config.embedding_model_id,
-                source="memory_embed",
-                resp_json=None,
-                fallback_prompt=estimate_tokens(content),
-                fallback_completion=0,
-            )
+            if not getattr(self.embedder, "last_cache_hit", False):
+                await self._record_usage(
+                    app_id=job.app_id,
+                    user_id=job.user_id,
+                    model_id=self.config.embedding_model_id,
+                    source="memory_embed",
+                    resp_json=None,
+                    fallback_prompt=estimate_tokens(content),
+                    fallback_completion=0,
+                )
 
             record, action = await self.memory_repo.upsert_semantic_memory(
                 app_id=job.app_id,

@@ -257,7 +257,12 @@ def create_app(
             app.state.client = custom_http_client
         else:
             timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
-            app.state.client = httpx.AsyncClient(timeout=timeout)
+            limits = httpx.Limits(
+                max_keepalive_connections=32,
+                max_connections=64,
+                keepalive_expiry=60.0,
+            )
+            app.state.client = httpx.AsyncClient(timeout=timeout, limits=limits)
 
         db = DatabaseManager(config.database_url, seed_keys=config.app_api_keys_seed)
         await db.connect()
@@ -310,6 +315,7 @@ def create_app(
             "X-Session-Id",
             "X-Memories-Recalled",
             "X-Context-Tokens",
+            "X-Router-Prep-Ms",
         ],
     )
 
@@ -396,6 +402,7 @@ def create_app(
 
     @fastapi_app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
+        prep_start = time.perf_counter()
         try:
             payload = await request.json()
         except Exception as exc:
@@ -429,7 +436,12 @@ def create_app(
         else:
             _inject_stateless_system_prompt(payload, agent_sys_prompt)
 
-        extra_headers: dict[str, str] = {"X-App-Id": scope.app_id}
+        payload.setdefault("cache_prompt", True)
+        prep_ms = (time.perf_counter() - prep_start) * 1000.0
+        extra_headers: dict[str, str] = {
+            "X-App-Id": scope.app_id,
+            "X-Router-Prep-Ms": f"{prep_ms:.2f}",
+        }
         if scope.session_id:
             extra_headers["X-Session-Id"] = scope.session_id
         if assembled is not None:
@@ -563,6 +575,8 @@ def create_app(
             upstream_path,
             allowed_models if isinstance(allowed_models, list) else None,
         )
+        if source == "completion":
+            payload.setdefault("cache_prompt", True)
         client: httpx.AsyncClient = request.app.state.client
         try:
             resp = await client.post(target_url, json=payload)

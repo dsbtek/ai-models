@@ -414,6 +414,12 @@ class FakeMemoryRepo:
         self.memories = memories_ref
         self.sessions = sessions_ref
 
+    async def has_active_memories(self, app_id: str, user_id: str) -> bool:
+        return any(
+            m["app_id"] == app_id and m["user_id"] == user_id and m["is_active"]
+            for m in self.memories
+        )
+
     @staticmethod
     def _cos(a: list[float], b: list[float]) -> float:
         dot = sum(x * y for x, y in zip(a, b))

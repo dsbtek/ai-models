@@ -16,8 +16,16 @@ services:
       - "${LLAMA_THREADS:-4}"
       - -c
       - "${LLAMA_CTX_SIZE:-2048}"
+      - -b
+      - "${LLAMA_BATCH_SIZE:-512}"
+      - -ub
+      - "${LLAMA_UBATCH_SIZE:-256}"
       - -np
       - "${LLAMA_PARALLEL:-1}"
+      - --cache-reuse
+      - "${LLAMA_CACHE_REUSE:-64}"
+      - -fa
+      - -cb
       - --alias
       - llama-3.2-1b
 
@@ -38,8 +46,16 @@ services:
       - "${LLAMA_THREADS:-4}"
       - -c
       - "${LLAMA_CTX_SIZE:-2048}"
+      - -b
+      - "${LLAMA_BATCH_SIZE:-512}"
+      - -ub
+      - "${LLAMA_UBATCH_SIZE:-256}"
       - -np
       - "${LLAMA_PARALLEL:-1}"
+      - --cache-reuse
+      - "${LLAMA_CACHE_REUSE:-64}"
+      - -fa
+      - -cb
       - --alias
       - qwen2.5-1.5b
 
