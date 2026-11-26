@@ -1,6 +1,17 @@
-# Containerized Multi-Model `llama.cpp` API, Memory Router & Playground
+# CortexLoom — Self-Hosted Multi-Model `llama.cpp`, Virtual-Agent & Memory Fabric
 
-Run multiple CPU-only `llama.cpp` (`llama-server`) models in Docker behind a single OpenAI-compatible REST & SSE streaming API (`http://localhost:8080/v1`) with:
+**CortexLoom** is a lightweight, self-hosted AI inference and long-term memory platform designed to run entirely on **standard CPU hardware**—with zero GPU requirements and zero cloud token bills.
+
+## Introduction: What CortexLoom Achieves
+
+Running local LLMs on CPU usually forces a painful trade-off: models small enough to run fast (`1B–1.5B` parameters with a `2048`-token context window) quickly forget earlier conversation turns and struggle when asked to handle routing, coding, extraction, and general chat in a single prompt. Meanwhile, spinning up separate model servers for every app or microservice wastes gigabytes of RAM.
+
+**CortexLoom solves this by turning a single CPU host into a shared, multi-tenant AI & memory backbone for all your applications:**
+1. **Specialist Models + Zero-RAM Virtual Agents**: Instead of one oversized model, CortexLoom coordinates fast quantized models (`Llama-3.2-1B-Instruct`, `Qwen2.5-1.5B-Instruct`, and `all-MiniLM-L6-v2`) behind a unified OpenAI-compatible `/v1` gateway and exposes **8 specialized virtual agents** (`coder`, `code-reviewer`, `sql-assistant`, `json-extractor`, `summarizer`, `translator`, `classifier`, `general-assistant`) that share the same loaded model weights in RAM.
+2. **Long-Term Memory Inside a `2048`-Token Budget**: A deterministic Context Assembler and an idle-CPU Background Memory Worker continuously compact older turns into rolling summaries and extract durable user facts into **PostgreSQL 16 + `pgvector`**—giving compact CPU models persistent, cross-session memory without ever overflowing their context window.
+3. **One Deployment, Many Isolated Applications**: Every integrated app gets its own `ak_<app_id>_...` API key, strict `(app_id, user_id)` data isolation, seamless startup SQL migrations, and per-app / per-user token usage attribution.
+
+### Core Capabilities
 - **Multi-Model & Virtual Agent Routing**: Route requests across `llama-3.2-1b`, `qwen2.5-1.5b`, `all-minilm-l6-v2`, and **8 zero-extra-RAM virtual agents** (`coder`, `code-reviewer`, `sql-assistant`, `json-extractor`, `summarizer`, `translator`, `classifier`, `general-assistant`).
 - **Multi-Tenant Session & Semantic User Memory**: Backed by PostgreSQL 16 + `pgvector` and local `384`-d embeddings, with automatic rolling conversation compaction, background durable fact extraction, and strict `2048`-token context packing.
 - **Integrated App Registration & API Keys (`ak_<app_id>_...`)**: Cryptographic `(app_id, user_id)` tenant isolation with a zero-friction `AUTH_MODE=dev` sandbox and `AUTH_MODE=strict` production guard.
