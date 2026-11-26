@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>llama.cpp Multi-Model &amp; Memory Playground</title>
+  <link rel="stylesheet" href="/playground/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <div class="brand-titles">
+        <h1>llama.cpp Studio</h1>
+        <span class="subtitle">Multi-Model, Virtual Agents &amp; Tenant Memory</span>
+      </div>
+    </div>
+    <div class="telemetry-bar" id="healthBar">
+      <span class="pill pill-neutral">Checking health...</span>
+    </div>
+    <div class="topbar-actions">
+      <button id="btnRefreshHealth" class="btn btn-ghost btn-sm" title="Refresh backend &amp; DB health">Refresh</button>
+      <button id="btnOpenAppsModal" class="btn btn-primary btn-sm">Apps &amp; Keys</button>
+    </div>
+  </header>
+
+  <!-- MOBILE / TABLET DRAWER BAR -->
+  <nav class="mobile-drawer-bar" aria-label="Mobile workspace panels">
+    <button type="button" id="btnToggleLeftDrawer" class="btn btn-secondary btn-sm">☰ Auth &amp; Sessions</button>
+    <span id="mobileScopePill" class="mobile-scope-pill">dev-sandbox / alice</span>
+    <button type="button" id="btnToggleRightDrawer" class="btn btn-secondary btn-sm">⚙ Config &amp; Memory</button>
+  </nav>
+
+  <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
+
+  <main class="workspace">
+    <!-- LEFT SIDEBAR: Auth, Tenant Scope & Sessions -->
+    <aside id="paneLeft" class="pane pane-left">
+      <div class="drawer-close-row">
+        <strong>Scope &amp; Sessions</strong>
+        <button type="button" id="btnCloseLeftDrawer" class="btn btn-ghost btn-xs">✕ Close</button>
+      </div>
+
+      <section class="panel-section">
+        <div class="section-header">
+          <h2>App Authentication</h2>
+          <span id="authVerifiedBadge" class="badge badge-muted">Sandbox</span>
+        </div>
+
+        <div class="segmented" role="tablist">
+          <button type="button" class="seg-btn active" data-auth-tab="sandbox">Dev Sandbox</button>
+          <button type="button" class="seg-btn" data-auth-tab="apikey">App API Key</button>
+        </div>
+
+        <div id="authSandboxBox" class="field-group">
+          <label for="inputAppId">Sandbox App ID (<code>X-App-Id</code>)</label>
+          <input id="inputAppId" type="text" value="dev-sandbox" placeholder="dev-sandbox" />
+          <small class="hint">Works without a key when <code>AUTH_MODE=dev</code>.</small>
+        </div>
+
+        <div id="authApiKeyBox" class="field-group hidden">
+          <label for="inputApiKey">Issued App Key (<code>Bearer ak_...</code>)</label>
+          <div class="input-row">
+            <input id="inputApiKey" type="password" placeholder="ak_my-app_..." autocomplete="off" />
+            <button type="button" id="btnToggleKeyVis" class="btn btn-ghost btn-sm">Show</button>
+          </div>
+          <div class="row-between">
+            <small id="resolvedAppLabel" class="hint">Resolves <code>app_id</code> from key hash</small>
+            <button type="button" id="btnVerifyKey" class="btn btn-ghost btn-xs">Verify</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-header">
+          <h2>User Scope</h2>
+        </div>
+        <div class="field-group">
+          <label for="inputUserId">User ID (<code>X-User-Id</code> / <code>user</code>)</label>
+          <input id="inputUserId" type="text" value="alice" placeholder="e.g. user_123" />
+          <div class="chip-row">
+            <span class="hint">Quick switch:</span>
+            <button type="button" class="chip user-preset" data-user="alice">alice</button>
+            <button type="button" class="chip user-preset" data-user="bob">bob</button>
+            <button type="button" class="chip user-preset" data-user="charlie">charlie</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-section sessions-section">
+        <div class="section-header">
+          <h2>Sessions</h2>
+          <button type="button" id="btnNewSession" class="btn btn-secondary btn-xs">+ New</button>
+        </div>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="chkUseSession" checked />
+          <span>Bind active <code>X-Session-Id</code></span>
+        </label>
+
+        <div id="activeSessionBox" class="field-group">
+          <input id="inputSessionId" type="text" placeholder="sess_..." />
+        </div>
+
+        <div id="sessionsList" class="list-scroll">
+          <div class="empty-note">No saved sessions yet for this (app, user).</div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- CENTER PANE: Chat, Embeddings, Raw Completions & Code Drawer -->
+    <section class="pane pane-center">
+      <div class="mode-tabs">
+        <div class="mode-tabs-scroll">
+          <button type="button" class="mode-tab active" data-mode="chat">Chat &amp; Agents</button>
+          <button type="button" class="mode-tab" data-mode="embeddings">Embeddings Lab</button>
+          <button type="button" class="mode-tab" data-mode="completions">Raw Completions</button>
+        </div>
+        <div class="mode-tabs-right">
+          <button type="button" id="btnToggleCodeDrawer" class="btn btn-ghost btn-xs">cURL / SDK</button>
+          <button type="button" id="btnClearChat" class="btn btn-ghost btn-xs">Clear</button>
+        </div>
+      </div>
+
+      <!-- TAB 1: CHAT -->
+      <div id="viewChat" class="mode-view">
+        <div id="chatMetricsBar" class="metrics-bar">
+          <span id="metricScope">Scope: <strong>dev-sandbox / alice</strong></span>
+          <span id="metricTokens">Context: <strong>0 / 2048</strong> tok</span>
+          <span id="metricMemories">Recalled: <strong>0</strong></span>
+          <span id="metricSpeed">Speed: <strong>—</strong></span>
+        </div>
+
+        <div id="chatMessages" class="chat-stream"></div>
+
+        <form id="chatForm" class="composer">
+          <div class="composer-box">
+            <textarea id="chatInput" rows="1" placeholder="Message model or virtual agent... (Enter to send, Shift+Enter newline)"></textarea>
+            <div class="composer-actions">
+              <button type="button" id="btnStopStream" class="btn btn-danger btn-sm hidden">Stop</button>
+              <button type="submit" id="btnSendChat" class="btn btn-primary btn-sm">Send ↑</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <!-- TAB 2: EMBEDDINGS -->
+      <div id="viewEmbeddings" class="mode-view hidden">
+        <div class="lab-container">
+          <h3>Local Embeddings &amp; Cosine Similarity Lab (<code>all-minilm-l6-v2</code>)</h3>
+          <p class="hint">Generate 384-dimensional vectors and compare semantic similarity between two texts.</p>
+          <div class="field-group">
+            <label for="embTextA">Text A (Primary Input)</label>
+            <textarea id="embTextA" rows="3" placeholder="e.g. User prefers PostgreSQL with pgvector and FastAPI"></textarea>
+          </div>
+          <div class="field-group">
+            <label for="embTextB">Text B (Optional — Compare Similarity)</label>
+            <textarea id="embTextB" rows="3" placeholder="e.g. Favorite backend stack is Python FastAPI + Postgres"></textarea>
+          </div>
+          <div>
+            <button type="button" id="btnRunEmbeddings" class="btn btn-primary">Compute Embeddings</button>
+          </div>
+          <div id="embResults" class="lab-results hidden"></div>
+        </div>
+      </div>
+
+      <!-- TAB 3: RAW COMPLETIONS -->
+      <div id="viewCompletions" class="mode-view hidden">
+        <div class="lab-container">
+          <h3>Raw Text Completion (<code>POST /v1/completions</code>)</h3>
+          <div class="field-group">
+            <label for="rawPromptInput">Prompt</label>
+            <textarea id="rawPromptInput" rows="5" placeholder="def fibonacci(n: int) -> int:"></textarea>
+          </div>
+          <div>
+            <button type="button" id="btnRunCompletion" class="btn btn-primary">Generate Completion</button>
+          </div>
+          <pre id="rawCompletionOutput" class="code-block hidden"></pre>
+        </div>
+      </div>
+
+      <!-- CODE / CURL EXPORT DRAWER -->
+      <div id="codeDrawer" class="code-drawer hidden">
+        <div class="drawer-header">
+          <div class="segmented segmented-inline">
+            <button type="button" class="seg-btn active" data-snippet="curl">cURL</button>
+            <button type="button" class="seg-btn" data-snippet="python">Python SDK</button>
+            <button type="button" class="seg-btn" data-snippet="json">JSON + Headers</button>
+          </div>
+          <button type="button" id="btnCopySnippet" class="btn btn-secondary btn-xs">Copy</button>
+        </div>
+        <pre id="codeSnippetContent" class="code-block"></pre>
+      </div>
+    </section>
+
+    <!-- RIGHT SIDEBAR: Parameters & Live Memory Inspector -->
+    <aside id="paneRight" class="pane pane-right">
+      <div class="drawer-close-row">
+        <strong>Configuration &amp; Memory</strong>
+        <button type="button" id="btnCloseRightDrawer" class="btn btn-ghost btn-xs">✕ Close</button>
+      </div>
+
+      <div class="segmented" role="tablist">
+        <button type="button" class="seg-btn active" data-right-tab="params">Configuration</button>
+        <button type="button" class="seg-btn" data-right-tab="memory">Memory Inspector</button>
+      </div>
+
+      <!-- RIGHT TAB 1: CONFIGURATION -->
+      <div id="rightParamsPane" class="right-scroll">
+        <div class="field-group">
+          <div class="row-between">
+            <label for="selectModel">Model / Virtual Agent</label>
+            <button type="button" id="btnResetDefaults" class="btn btn-ghost btn-xs">Reset</button>
+          </div>
+          <select id="selectModel"></select>
+          <div id="modelInfoCard" class="info-card"></div>
+        </div>
+
+        <div class="field-group">
+          <label for="selectMemoryMode">Memory Mode (<code>X-Memory-Mode</code>)</label>
+          <select id="selectMemoryMode">
+            <option value="auto" selected>auto — Recall + persist session &amp; facts</option>
+            <option value="read_only">read_only — Recall without saving</option>
+            <option value="session_only">session_only — Session transcript only</option>
+            <option value="off">off — Stateless pass-through</option>
+          </select>
+        </div>
+
+        <div class="field-group">
+          <label for="selectHistoryMode">Client Payload Style</label>
+          <select id="selectHistoryMode">
+            <option value="stateful" selected>Server-Stateful (latest message only)</option>
+            <option value="client_array">Full Client Array (re-send history)</option>
+          </select>
+        </div>
+
+        <div class="toggle-grid">
+          <label class="checkbox-row">
+            <input type="checkbox" id="chkStream" checked />
+            <span>Stream SSE (<code>stream: true</code>)</span>
+          </label>
+        </div>
+
+        <div class="field-group">
+          <label for="inputSystemPrompt">Custom System Prompt (Optional)</label>
+          <textarea id="inputSystemPrompt" rows="2" placeholder="Appended to agent system prompt..."></textarea>
+        </div>
+
+        <div class="slider-group">
+          <div class="row-between">
+            <label for="rangeTemp">Temperature</label>
+            <span id="valTemp" class="mono">0.70</span>
+          </div>
+          <input id="rangeTemp" type="range" min="0" max="2" step="0.05" value="0.7" />
+        </div>
+
+        <div class="slider-group">
+          <div class="row-between">
+            <label for="rangeTopP">Top P</label>
+            <span id="valTopP" class="mono">0.95</span>
+          </div>
+          <input id="rangeTopP" type="range" min="0.05" max="1" step="0.05" value="0.95" />
+        </div>
+
+        <div class="slider-group">
+          <div class="row-between">
+            <label for="rangeMaxTokens">Max Completion Tokens</label>
+            <span id="valMaxTokens" class="mono">512</span>
+          </div>
+          <input id="rangeMaxTokens" type="range" min="32" max="1408" step="32" value="512" />
+        </div>
+
+        <div class="slider-group">
+          <div class="row-between">
+            <label for="rangePresPen">Presence Penalty</label>
+            <span id="valPresPen" class="mono">0.0</span>
+          </div>
+          <input id="rangePresPen" type="range" min="-2" max="2" step="0.1" value="0" />
+        </div>
+
+        <div class="slider-group">
+          <div class="row-between">
+            <label for="rangeFreqPen">Frequency Penalty</label>
+            <span id="valFreqPen" class="mono">0.0</span>
+          </div>
+          <input id="rangeFreqPen" type="range" min="-2" max="2" step="0.1" value="0" />
+        </div>
+
+        <div class="two-col">
+          <div class="field-group">
+            <label for="inputSeed">Seed</label>
+            <input id="inputSeed" type="number" placeholder="Optional" />
+          </div>
+          <div class="field-group">
+            <label for="inputTtlHours">Session TTL (hrs)</label>
+            <input id="inputTtlHours" type="number" min="0" placeholder="0 = none" />
+          </div>
+        </div>
+
+        <div class="field-group">
+          <label for="inputStopSeq">Stop Sequences (comma-separated)</label>
+          <input id="inputStopSeq" type="text" placeholder="e.g. \nUser:, <|eot_id|>" />
+        </div>
+      </div>
+
+      <!-- RIGHT TAB 2: MEMORY INSPECTOR -->
+      <div id="rightMemoryPane" class="right-scroll hidden">
+        <div class="inspector-card">
+          <div class="row-between">
+            <h3>Context Budget</h3>
+            <span id="budgetLabel" class="mono">0 / 2048</span>
+          </div>
+          <div class="progress-track">
+            <div id="budgetFill" class="progress-fill" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <div class="inspector-card">
+          <div class="row-between">
+            <h3>Rolling Session Summary</h3>
+            <button type="button" id="btnCompactSession" class="btn btn-secondary btn-xs">Compact Now</button>
+          </div>
+          <small id="summaryMeta" class="hint">Summarized up to seq 0 / 0 messages</small>
+          <div id="rollingSummaryText" class="summary-box">No rolling summary yet.</div>
+        </div>
+
+        <div class="inspector-card">
+          <div class="row-between">
+            <h3>Long-Term User Memories</h3>
+            <button type="button" id="btnRefreshMemories" class="btn btn-ghost btn-xs">Reload</button>
+          </div>
+
+          <div class="input-row">
+            <input id="inputSearchMemories" type="text" placeholder="Semantic search query..." />
+            <button type="button" id="btnSearchMemories" class="btn btn-secondary btn-xs">Search</button>
+          </div>
+
+          <details class="add-memory-details">
+            <summary>+ Add Durable User Fact</summary>
+            <div class="add-memory-form">
+              <div class="two-col">
+                <select id="selectMemCategory">
+                  <option value="fact">fact</option>
+                  <option value="preference">preference</option>
+                  <option value="profile">profile</option>
+                  <option value="goal">goal</option>
+                  <option value="constraint">constraint</option>
+                  <option value="episodic">episodic</option>
+                </select>
+                <select id="selectMemImportance">
+                  <option value="5">Importance: 5</option>
+                  <option value="4">Importance: 4</option>
+                  <option value="3" selected>Importance: 3</option>
+                  <option value="2">Importance: 2</option>
+                  <option value="1">Importance: 1</option>
+                </select>
+              </div>
+              <textarea id="inputNewMemory" rows="2" placeholder="e.g. Prefers concise TypeScript examples with strict types."></textarea>
+              <button type="button" id="btnAddMemory" class="btn btn-primary btn-xs">Save &amp; Embed Fact</button>
+            </div>
+          </details>
+
+          <div id="memoriesList" class="memories-list">
+            <div class="empty-note">No long-term memories stored for this (app, user).</div>
+          </div>
+
+          <div class="danger-zone">
+            <button type="button" id="btnWipeUserData" class="btn btn-danger btn-xs">Wipe User Sessions &amp; Memories</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- MODAL: INTEGRATED APP REGISTRATION & API KEY MANAGER -->
+  <div id="appsModal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2>Integrated Applications &amp; API Keys</h2>
+          <p class="hint">Each registered app receives an isolated <code>ak_&lt;app_id&gt;_...</code> key (stored as SHA-256 hash).</p>
+        </div>
+        <button type="button" id="btnCloseAppsModal" class="btn btn-ghost btn-sm">Close</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="field-group">
+          <label for="inputAdminKey">Admin API Key (<code>X-Admin-Key</code> — optional on LAN/localhost in <code>dev</code> mode)</label>
+          <input id="inputAdminKey" type="password" placeholder="Leave blank if ADMIN_API_KEY is unset in dev mode" />
+        </div>
+
+        <form id="createAppForm" class="register-app-bar">
+          <input id="newAppId" type="text" required placeholder="app_id (e.g. crm-web)" />
+          <input id="newAppName" type="text" placeholder="Display Name (e.g. CRM Web App)" />
+          <button type="submit" class="btn btn-primary btn-sm">Register &amp; Issue Key</button>
+        </form>
+
+        <div id="issuedKeyBanner" class="key-banner hidden">
+          <div style="min-width:0">
+            <strong>Issued API Key (shown once):</strong>
+            <code id="issuedKeyValue" class="key-code"></code>
+          </div>
+          <div class="input-row">
+            <button type="button" id="btnCopyIssuedKey" class="btn btn-secondary btn-xs">Copy</button>
+            <button type="button" id="btnUseIssuedKey" class="btn btn-primary btn-xs">Use in Playground</button>
+          </div>
+        </div>
+
+        <div id="appsTableWrap" class="apps-table-wrap"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="/playground/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,103 @@
+services:
+  llama-3.2-1b:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: llama-3.2-1b
+    restart: unless-stopped
+    volumes:
+      - ./models:/models:ro
+    command:
+      - -m
+      - /models/${LLAMA_MODEL_1_FILE:-Llama-3.2-1B-Instruct-Q4_K_M.gguf}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - -t
+      - "${LLAMA_THREADS:-4}"
+      - -c
+      - "${LLAMA_CTX_SIZE:-2048}"
+      - -np
+      - "${LLAMA_PARALLEL:-1}"
+      - --alias
+      - llama-3.2-1b
+
+  qwen2.5-1.5b:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: qwen2.5-1.5b
+    restart: unless-stopped
+    volumes:
+      - ./models:/models:ro
+    command:
+      - -m
+      - /models/${LLAMA_MODEL_2_FILE:-Qwen2.5-1.5B-Instruct-Q4_K_M.gguf}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - -t
+      - "${LLAMA_THREADS:-4}"
+      - -c
+      - "${LLAMA_CTX_SIZE:-2048}"
+      - -np
+      - "${LLAMA_PARALLEL:-1}"
+      - --alias
+      - qwen2.5-1.5b
+
+  all-minilm-l6-v2:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: all-minilm-l6-v2
+    restart: unless-stopped
+    volumes:
+      - ./models:/models:ro
+    command:
+      - -m
+      - /models/${LLAMA_EMBED_FILE:-all-MiniLM-L6-v2-ggml-model-f16.gguf}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - -t
+      - "2"
+      - -c
+      - "512"
+      - -b
+      - "512"
+      - -ub
+      - "512"
+      - -np
+      - "1"
+      - --embedding
+      - --pooling
+      - mean
+      - --alias
+      - all-minilm-l6-v2
+
+  api-router:
+    build:
+      context: ./router
+    container_name: llama-api-router
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8080}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - IN_DOCKER=1
+      - API_PORT=8080
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-llama-3.2-1b}
+      - DATABASE_URL=${DATABASE_URL:-}
+      - AUTH_MODE=${AUTH_MODE:-dev}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
+      - APP_API_KEYS_JSON=${APP_API_KEYS_JSON:-{}}
+      - LLAMA_CTX_SIZE=${LLAMA_CTX_SIZE:-2048}
+      - EMBEDDING_MODEL_ID=${EMBEDDING_MODEL_ID:-all-minilm-l6-v2}
+      - SUMMARY_MODEL_ID=${SUMMARY_MODEL_ID:-llama-3.2-1b}
+      - EXTRACTOR_MODEL_ID=${EXTRACTOR_MODEL_ID:-qwen2.5-1.5b}
+      - SESSION_DEFAULT_TTL_HOURS=${SESSION_DEFAULT_TTL_HOURS:-0}
+      - MEMORY_TOP_K=${MEMORY_TOP_K:-5}
+      - COMPACT_MIN_MESSAGES=${COMPACT_MIN_MESSAGES:-8}
+      - COMPACT_MIN_TOKENS=${COMPACT_MIN_TOKENS:-650}
+    depends_on:
+      - llama-3.2-1b
+      - qwen2.5-1.5b
+      - all-minilm-l6-v2

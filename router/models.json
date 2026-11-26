@@ -1,0 +1,81 @@
+{
+  "default_model": "llama-3.2-1b",
+  "models": {
+    "llama-3.2-1b": "http://llama-3.2-1b:8080",
+    "qwen2.5-1.5b": "http://qwen2.5-1.5b:8080",
+    "all-minilm-l6-v2": "http://all-minilm-l6-v2:8080"
+  },
+  "embedding_models": [
+    "all-minilm-l6-v2"
+  ],
+  "agents": {
+    "coder": {
+      "backend": "qwen2.5-1.5b",
+      "description": "Clean, working code with brief explanations",
+      "system_prompt": "You are a concise software engineer. Return clean, working code with brief explanations only when needed.",
+      "defaults": {
+        "temperature": 0.2
+      }
+    },
+    "code-reviewer": {
+      "backend": "qwen2.5-1.5b",
+      "description": "Identify bugs, security issues, edge cases, and improvements",
+      "system_prompt": "You are a senior code reviewer. Identify bugs, security issues, edge cases, and concrete improvements concisely.",
+      "defaults": {
+        "temperature": 0.2
+      }
+    },
+    "sql-assistant": {
+      "backend": "qwen2.5-1.5b",
+      "description": "Accurate SQL queries and brief schema assumptions",
+      "system_prompt": "You are a SQL expert. Write accurate, safe, well-formatted SQL queries and explain assumptions briefly.",
+      "defaults": {
+        "temperature": 0.1
+      }
+    },
+    "summarizer": {
+      "backend": "llama-3.2-1b",
+      "description": "Concise bullet-point summaries preserving key facts",
+      "system_prompt": "Summarize the provided text into clear, concise bullet points preserving key facts.",
+      "defaults": {
+        "temperature": 0.3
+      },
+      "extract_memories": false
+    },
+    "translator": {
+      "backend": "llama-3.2-1b",
+      "description": "Accurate language translation preserving tone and meaning",
+      "system_prompt": "Translate the user's text accurately into the requested target language while preserving tone and meaning.",
+      "defaults": {
+        "temperature": 0.2
+      },
+      "extract_memories": false
+    },
+    "classifier": {
+      "backend": "llama-3.2-1b",
+      "description": "Category or sentiment classification with a one-line reason",
+      "system_prompt": "Classify the user's input into the requested categories or sentiment. Reply with only the label and a one-line reason.",
+      "defaults": {
+        "temperature": 0.0
+      },
+      "extract_memories": false
+    },
+    "json-extractor": {
+      "backend": "qwen2.5-1.5b",
+      "description": "Structured JSON extraction without markdown fences",
+      "system_prompt": "Extract structured data from the user's text and respond with valid JSON only, without markdown fences.",
+      "defaults": {
+        "temperature": 0.0
+      },
+      "extract_memories": false
+    },
+    "general-assistant": {
+      "backend": "llama-3.2-1b",
+      "description": "Helpful general-purpose assistant",
+      "system_prompt": "You are a helpful, concise assistant.",
+      "defaults": {
+        "temperature": 0.7
+      }
+    }
+  }
+}
