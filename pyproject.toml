@@ -1,0 +1,20 @@
+[project]
+name = "ai-models"
+version = "2.0.0"
+description = "Containerized Multi-Model llama.cpp API, Memory Router & Playground"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "httpx==0.28.1",
+    "asyncpg==0.30.0",
+    "pgvector==0.3.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.2",
+    "asgi-lifespan==2.1.0",
+]
