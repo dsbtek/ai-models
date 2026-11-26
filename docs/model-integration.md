@@ -159,6 +159,18 @@ curl -s -X DELETE http://localhost:8080/v1/users/user_99/data \
   -H "Authorization: Bearer ak_my-saas_..."
 ```
 
+### 4. Querying App & User Token Usage (`/v1/usage`)
+```bash
+# Inspect prompt, completion, and total tokens for a specific user (broken down by model, source, and day)
+curl -s "http://localhost:8080/v1/usage?start_date=2026-01-01" \
+  -H "Authorization: Bearer ak_my-saas_..." \
+  -H "X-User-Id: user_99"
+
+# List per-user token usage leaderboard within your app
+curl -s "http://localhost:8080/v1/usage/users?limit=25" \
+  -H "Authorization: Bearer ak_my-saas_..."
+```
+
 ---
 
 ## Building an Agentic Application Harness
