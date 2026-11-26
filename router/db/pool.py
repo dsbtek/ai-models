@@ -16,6 +16,49 @@ from pgvector.asyncpg import register_vector
 logger = logging.getLogger("router.db")
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
+MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+MIGRATION_LOCK_KEY = "ai_models_router_migrations"
+
+
+async def apply_migrations(
+    conn: Any, migrations_dir: Path = MIGRATIONS_DIR
+) -> list[str]:
+    """Apply pending *.sql migrations in sorted order under a PostgreSQL advisory lock."""
+    await conn.execute("SELECT pg_advisory_lock(hashtext($1))", MIGRATION_LOCK_KEY)
+    try:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version     TEXT PRIMARY KEY,
+                applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        rows = await conn.fetch("SELECT version FROM schema_migrations")
+        applied = {str(r["version"]) for r in rows}
+
+        newly_applied: list[str] = []
+        if not migrations_dir.exists():
+            return newly_applied
+
+        for path in sorted(migrations_dir.glob("*.sql")):
+            version = path.stem
+            if version in applied:
+                continue
+            sql = path.read_text(encoding="utf-8")
+            async with conn.transaction():
+                if sql.strip():
+                    await conn.execute(sql)
+                await conn.execute(
+                    "INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
+                    version,
+                )
+            newly_applied.append(version)
+            logger.info("Applied database migration: %s", version)
+
+        return newly_applied
+    finally:
+        await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", MIGRATION_LOCK_KEY)
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
@@ -77,8 +120,7 @@ class DatabaseManager:
                         logger.error(hint)
                         raise RuntimeError(hint) from exc
 
-                schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
-                await bootstrap_conn.execute(schema_sql)
+                await apply_migrations(bootstrap_conn)
             finally:
                 await bootstrap_conn.close()
 
@@ -140,7 +182,13 @@ class DatabaseManager:
             pool = await self.ensure_pool()
             async with pool.acquire() as conn:
                 val = await conn.fetchval("SELECT 1")
-            return {"status": "ok" if val == 1 else "degraded"}
+                applied_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM schema_migrations"
+                )
+            return {
+                "status": "ok" if val == 1 else "degraded",
+                "applied_migrations": int(applied_count or 0),
+            }
         except Exception as exc:
             return {"status": "unreachable", "detail": str(exc)}
 

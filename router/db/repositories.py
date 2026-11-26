@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import re
 import secrets
@@ -14,6 +14,16 @@ from .pool import DatabaseManager
 VALID_APP_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,62}$")
 VALID_CATEGORIES = frozenset(
     {"preference", "profile", "fact", "goal", "constraint", "episodic"}
+)
+VALID_USAGE_SOURCES = frozenset(
+    {
+        "chat",
+        "completion",
+        "embedding",
+        "memory_extract",
+        "memory_compact",
+        "memory_embed",
+    }
 )
 
 
@@ -930,3 +940,235 @@ class MemoryRepository:
                 "expired_memories": int(m_stat.split()[-1]) if m_stat else 0,
                 "expired_sessions": int(s_stat.split()[-1]) if s_stat else 0,
             }
+
+
+class UsageRepository:
+    """Tenant-isolated daily token usage aggregation per (app_id, user_id, model_id, source)."""
+
+    def __init__(self, db: DatabaseManager) -> None:
+        self.db = db
+
+    async def record_usage(
+        self,
+        *,
+        app_id: str,
+        user_id: str | None,
+        model_id: str,
+        source: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int | None = None,
+        usage_date: date | None = None,
+    ) -> None:
+        if source not in VALID_USAGE_SOURCES:
+            raise ValueError(f"Invalid usage source: {source}")
+        p_tok = max(0, int(prompt_tokens))
+        c_tok = max(0, int(completion_tokens))
+        t_tok = max(p_tok + c_tok, int(total_tokens)) if total_tokens is not None else p_tok + c_tok
+        if t_tok == 0 and p_tok == 0 and c_tok == 0:
+            return
+
+        pool = await self.db.ensure_pool()
+        target_date = usage_date or datetime.now(timezone.utc).date()
+        norm_user = (user_id or "").strip()
+
+        async with pool.acquire() as conn:
+            # Ensure sandbox app row exists for stateless calls so FK on apps(app_id) succeeds.
+            await conn.execute(
+                """
+                INSERT INTO apps (app_id, name, api_key_hash, api_key_prefix, is_active, settings)
+                VALUES ($1, $2, NULL, NULL, TRUE, '{"sandbox": true}'::jsonb)
+                ON CONFLICT (app_id) DO NOTHING
+                """,
+                app_id,
+                f"Dev Sandbox ({app_id})",
+            )
+            await conn.execute(
+                """
+                INSERT INTO token_usage_daily (
+                    usage_date, app_id, user_id, model_id, source,
+                    request_count, prompt_tokens, completion_tokens, total_tokens
+                )
+                VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8)
+                ON CONFLICT (usage_date, app_id, user_id, model_id, source) DO UPDATE
+                SET request_count = token_usage_daily.request_count + 1,
+                    prompt_tokens = token_usage_daily.prompt_tokens + EXCLUDED.prompt_tokens,
+                    completion_tokens = token_usage_daily.completion_tokens + EXCLUDED.completion_tokens,
+                    total_tokens = token_usage_daily.total_tokens + EXCLUDED.total_tokens,
+                    updated_at = NOW()
+                """,
+                target_date,
+                app_id,
+                norm_user,
+                model_id,
+                source,
+                p_tok,
+                c_tok,
+                t_tok,
+            )
+
+    @staticmethod
+    def _build_filters(
+        app_id: str,
+        user_id: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        model_id: str | None = None,
+        source: str | None = None,
+    ) -> tuple[str, list[Any]]:
+        clauses = ["app_id = $1"]
+        params: list[Any] = [app_id]
+        if user_id is not None:
+            params.append(user_id.strip())
+            clauses.append(f"user_id = ${len(params)}")
+        if start_date is not None:
+            params.append(start_date)
+            clauses.append(f"usage_date >= ${len(params)}")
+        if end_date is not None:
+            params.append(end_date)
+            clauses.append(f"usage_date <= ${len(params)}")
+        if model_id is not None:
+            params.append(model_id)
+            clauses.append(f"model_id = ${len(params)}")
+        if source is not None:
+            params.append(source)
+            clauses.append(f"source = ${len(params)}")
+        return " AND ".join(clauses), params
+
+    async def get_usage_summary(
+        self,
+        *,
+        app_id: str,
+        user_id: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        model_id: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        pool = await self.db.ensure_pool()
+        where_sql, params = self._build_filters(
+            app_id=app_id,
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date,
+            model_id=model_id,
+            source=source,
+        )
+        async with pool.acquire() as conn:
+            totals_row = await conn.fetchrow(
+                f"""
+                SELECT COALESCE(SUM(request_count), 0) AS request_count,
+                       COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                FROM token_usage_daily
+                WHERE {where_sql}
+                """,
+                *params,
+            )
+            by_model_rows = await conn.fetch(
+                f"""
+                SELECT model_id,
+                       SUM(request_count) AS request_count,
+                       SUM(prompt_tokens) AS prompt_tokens,
+                       SUM(completion_tokens) AS completion_tokens,
+                       SUM(total_tokens) AS total_tokens
+                FROM token_usage_daily
+                WHERE {where_sql}
+                GROUP BY model_id
+                ORDER BY total_tokens DESC
+                """,
+                *params,
+            )
+            by_source_rows = await conn.fetch(
+                f"""
+                SELECT source,
+                       SUM(request_count) AS request_count,
+                       SUM(prompt_tokens) AS prompt_tokens,
+                       SUM(completion_tokens) AS completion_tokens,
+                       SUM(total_tokens) AS total_tokens
+                FROM token_usage_daily
+                WHERE {where_sql}
+                GROUP BY source
+                ORDER BY total_tokens DESC
+                """,
+                *params,
+            )
+            by_day_rows = await conn.fetch(
+                f"""
+                SELECT usage_date,
+                       SUM(request_count) AS request_count,
+                       SUM(prompt_tokens) AS prompt_tokens,
+                       SUM(completion_tokens) AS completion_tokens,
+                       SUM(total_tokens) AS total_tokens
+                FROM token_usage_daily
+                WHERE {where_sql}
+                GROUP BY usage_date
+                ORDER BY usage_date DESC
+                LIMIT 90
+                """,
+                *params,
+            )
+
+        def _agg(row: Any) -> dict[str, int]:
+            return {
+                "request_count": int(row["request_count"] or 0),
+                "prompt_tokens": int(row["prompt_tokens"] or 0),
+                "completion_tokens": int(row["completion_tokens"] or 0),
+                "total_tokens": int(row["total_tokens"] or 0),
+            }
+
+        return {
+            "totals": _agg(totals_row),
+            "by_model": [{"model_id": r["model_id"], **_agg(r)} for r in by_model_rows],
+            "by_source": [{"source": r["source"], **_agg(r)} for r in by_source_rows],
+            "by_day": [{"date": r["usage_date"].isoformat(), **_agg(r)} for r in by_day_rows],
+        }
+
+    async def list_user_usage(
+        self,
+        *,
+        app_id: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        pool = await self.db.ensure_pool()
+        where_sql, params = self._build_filters(
+            app_id=app_id, start_date=start_date, end_date=end_date
+        )
+        limit_idx = len(params) + 1
+        offset_idx = len(params) + 2
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT user_id,
+                       SUM(request_count) AS request_count,
+                       SUM(prompt_tokens) AS prompt_tokens,
+                       SUM(completion_tokens) AS completion_tokens,
+                       SUM(total_tokens) AS total_tokens,
+                       MAX(usage_date) AS last_active_date
+                FROM token_usage_daily
+                WHERE {where_sql}
+                GROUP BY user_id
+                ORDER BY total_tokens DESC
+                LIMIT ${limit_idx} OFFSET ${offset_idx}
+                """,
+                *params,
+                limit,
+                offset,
+            )
+        return [
+            {
+                "user_id": r["user_id"] if r["user_id"] else None,
+                "request_count": int(r["request_count"] or 0),
+                "prompt_tokens": int(r["prompt_tokens"] or 0),
+                "completion_tokens": int(r["completion_tokens"] or 0),
+                "total_tokens": int(r["total_tokens"] or 0),
+                "last_active_date": r["last_active_date"].isoformat()
+                if r["last_active_date"]
+                else None,
+            }
+            for r in rows
+        ]

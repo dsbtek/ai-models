@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from auth import require_admin, resolve_request_scope
-from db.repositories import AppRepository
+from db.repositories import AppRepository, UsageRepository
 
 router = APIRouter(prefix="/v1/apps", tags=["apps"])
 
@@ -26,17 +26,26 @@ async def get_current_app(request: Request) -> dict[str, Any]:
     """Inspect the resolved application identity and memory statistics."""
     scope = await resolve_request_scope(request)
     app_repo: AppRepository = request.app.state.app_repo
+    usage_repo: UsageRepository | None = getattr(request.app.state, "usage_repo", None)
     app_info = None
+    token_usage = None
     if request.app.state.db.is_configured:
         try:
             app_info = await app_repo.get_app(scope.app_id)
         except Exception:
             app_info = None
+        if usage_repo is not None:
+            try:
+                summary = await usage_repo.get_usage_summary(app_id=scope.app_id)
+                token_usage = summary.get("totals")
+            except Exception:
+                token_usage = None
     return {
         "app_id": scope.app_id,
         "authenticated": scope.authenticated,
         "auth_mode": request.app.state.config.auth_mode,
         "app": app_info,
+        "token_usage": token_usage,
     }
 
 

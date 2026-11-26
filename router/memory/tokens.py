@@ -113,3 +113,27 @@ def pack_recent_history(
 
     selected_reversed.reverse()
     return selected_reversed
+
+
+def extract_usage_counts(
+    payload: dict[str, Any] | None,
+    fallback_prompt: int = 0,
+    fallback_completion: int = 0,
+) -> tuple[int, int, int]:
+    """Extract (prompt_tokens, completion_tokens, total_tokens) with deterministic fallback."""
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if isinstance(usage, dict):
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        total = usage.get("total_tokens")
+        p_val = max(0, int(prompt)) if isinstance(prompt, (int, float)) else max(0, int(fallback_prompt))
+        c_val = max(0, int(completion)) if isinstance(completion, (int, float)) else max(0, int(fallback_completion))
+        t_val = max(0, int(total)) if isinstance(total, (int, float)) else p_val + c_val
+        if p_val > 0 or c_val > 0 or t_val > 0:
+            if t_val < p_val + c_val:
+                t_val = p_val + c_val
+            return p_val, c_val, t_val
+
+    p_val = max(0, int(fallback_prompt))
+    c_val = max(0, int(fallback_completion))
+    return p_val, c_val, p_val + c_val

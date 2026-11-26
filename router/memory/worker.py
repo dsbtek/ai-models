@@ -13,9 +13,9 @@ from typing import Any
 import httpx
 
 from config import RouterConfig
-from db.repositories import MemoryRepository, SessionRepository, VALID_CATEGORIES
+from db.repositories import MemoryRepository, SessionRepository, UsageRepository, VALID_CATEGORIES
 from .embeddings import EmbeddingClient
-from .tokens import estimate_tokens, flatten_message_content, truncate_to_tokens
+from .tokens import estimate_tokens, extract_usage_counts, flatten_message_content, truncate_to_tokens
 
 logger = logging.getLogger("router.memory.worker")
 
@@ -102,12 +102,14 @@ class MemoryWorker:
         session_repo: SessionRepository,
         memory_repo: MemoryRepository,
         embedder: EmbeddingClient,
+        usage_repo: UsageRepository | None = None,
     ) -> None:
         self.config = config
         self.http_client = http_client
         self.session_repo = session_repo
         self.memory_repo = memory_repo
         self.embedder = embedder
+        self.usage_repo = usage_repo
         self.queue: asyncio.Queue[PostTurnJob] = asyncio.Queue(maxsize=256)
         self._worker_task: asyncio.Task[None] | None = None
         self._reaper_task: asyncio.Task[None] | None = None
@@ -115,6 +117,37 @@ class MemoryWorker:
         self._active_inferences = 0
         self._idle_event = asyncio.Event()
         self._idle_event.set()
+
+    async def _record_usage(
+        self,
+        *,
+        app_id: str,
+        user_id: str | None,
+        model_id: str,
+        source: str,
+        resp_json: dict[str, Any] | None,
+        fallback_prompt: int,
+        fallback_completion: int,
+    ) -> None:
+        if self.usage_repo is None:
+            return
+        p_tok, c_tok, t_tok = extract_usage_counts(
+            resp_json,
+            fallback_prompt=fallback_prompt,
+            fallback_completion=fallback_completion,
+        )
+        try:
+            await self.usage_repo.record_usage(
+                app_id=app_id,
+                user_id=user_id,
+                model_id=model_id,
+                source=source,
+                prompt_tokens=p_tok,
+                completion_tokens=c_tok,
+                total_tokens=t_tok,
+            )
+        except Exception as exc:
+            logger.warning("Failed to record background %s token usage: %s", source, exc)
 
     def notify_inference_start(self) -> None:
         self._active_inferences += 1
@@ -268,7 +301,19 @@ class MemoryWorker:
                 timeout=45.0,
             )
             resp.raise_for_status()
-            choices = resp.json().get("choices") or []
+            resp_json = resp.json()
+            await self._record_usage(
+                app_id=app_id,
+                user_id=user_id,
+                model_id=self.config.summary_model_id,
+                source="memory_compact",
+                resp_json=resp_json,
+                fallback_prompt=estimate_tokens(ROLLING_SUMMARY_SYSTEM_PROMPT) + estimate_tokens(user_prompt),
+                fallback_completion=estimate_tokens(
+                    ((resp_json.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+                ),
+            )
+            choices = resp_json.get("choices") or []
             summary_text = (
                 (choices[0].get("message") or {}).get("content", "").strip()
                 if choices
@@ -325,11 +370,21 @@ class MemoryWorker:
             timeout=45.0,
         )
         resp.raise_for_status()
-        choices = resp.json().get("choices") or []
+        resp_json = resp.json()
+        choices = resp_json.get("choices") or []
         raw_output = (
             (choices[0].get("message") or {}).get("content", "").strip()
             if choices
             else ""
+        )
+        await self._record_usage(
+            app_id=job.app_id,
+            user_id=job.user_id,
+            model_id=self.config.extractor_model_id,
+            source="memory_extract",
+            resp_json=resp_json,
+            fallback_prompt=estimate_tokens(FACT_EXTRACTION_SYSTEM_PROMPT) + estimate_tokens(extraction_input),
+            fallback_completion=estimate_tokens(raw_output),
         )
         items = _parse_json_array(raw_output)[:3]
         stored: list[dict[str, Any]] = []
@@ -349,6 +404,15 @@ class MemoryWorker:
             vec = await self.embedder.embed_text(content, raise_on_error=False)
             if vec is None:
                 continue
+            await self._record_usage(
+                app_id=job.app_id,
+                user_id=job.user_id,
+                model_id=self.config.embedding_model_id,
+                source="memory_embed",
+                resp_json=None,
+                fallback_prompt=estimate_tokens(content),
+                fallback_completion=0,
+            )
 
             record, action = await self.memory_repo.upsert_semantic_memory(
                 app_id=job.app_id,

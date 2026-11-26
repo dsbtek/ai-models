@@ -8,7 +8,7 @@ from typing import Any
 
 from auth import RequestScope
 from config import RouterConfig
-from db.repositories import MemoryRepository, SessionRepository
+from db.repositories import MemoryRepository, SessionRepository, UsageRepository
 from .embeddings import EmbeddingClient
 from .tokens import (
     BudgetPlan,
@@ -117,11 +117,13 @@ class ContextAssembler:
         session_repo: SessionRepository,
         memory_repo: MemoryRepository,
         embedder: EmbeddingClient,
+        usage_repo: UsageRepository | None = None,
     ) -> None:
         self.config = config
         self.session_repo = session_repo
         self.memory_repo = memory_repo
         self.embedder = embedder
+        self.usage_repo = usage_repo
 
     async def assemble(
         self,
@@ -208,6 +210,20 @@ class ContextAssembler:
                 latest_user_text, raise_on_error=False
             )
             if query_vec is not None:
+                if self.usage_repo is not None:
+                    try:
+                        tok = estimate_tokens(latest_user_text)
+                        await self.usage_repo.record_usage(
+                            app_id=scope.app_id,
+                            user_id=scope.user_id,
+                            model_id=self.config.embedding_model_id,
+                            source="memory_embed",
+                            prompt_tokens=tok,
+                            completion_tokens=0,
+                            total_tokens=tok,
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to record memory_embed usage: %s", exc)
                 try:
                     retrieved_memories = await self.memory_repo.search_memories(
                         app_id=scope.app_id,

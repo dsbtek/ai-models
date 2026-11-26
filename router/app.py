@@ -24,14 +24,25 @@ import httpx
 from auth import RequestScope, resolve_request_scope
 from config import RouterConfig, load_config
 from db.pool import DatabaseManager
-from db.repositories import AppRepository, MemoryRepository, SessionRepository
+from db.repositories import (
+    AppRepository,
+    MemoryRepository,
+    SessionRepository,
+    UsageRepository,
+)
 from memory.assembler import AssembledContext, ContextAssembler
 from memory.embeddings import EmbeddingClient
-from memory.tokens import estimate_tokens, flatten_message_content
+from memory.tokens import (
+    estimate_messages_tokens,
+    estimate_tokens,
+    extract_usage_counts,
+    flatten_message_content,
+)
 from memory.worker import MemoryWorker, PostTurnJob
 from routes.apps import router as apps_router
 from routes.memories import router as memories_router
 from routes.sessions import router as sessions_router
+from routes.usage import router as usage_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +60,7 @@ class SSEContentAccumulator:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._tail = ""
         self.parts: list[str] = []
+        self.usage: dict[str, Any] | None = None
 
     def feed(self, chunk: bytes) -> None:
         self._tail += self._decoder.decode(chunk, final=False)
@@ -71,6 +83,8 @@ class SSEContentAccumulator:
             return
         try:
             event = json.loads(data_str)
+            if isinstance(event.get("usage"), dict):
+                self.usage = event["usage"]
             choices = event.get("choices") or []
             if choices:
                 delta = choices[0].get("delta") or {}
@@ -139,6 +153,41 @@ def _inject_stateless_system_prompt(
     else:
         messages.insert(0, {"role": "system", "content": system_prompt})
     payload["messages"] = messages
+
+
+async def _safe_record_usage(
+    app: FastAPI,
+    *,
+    app_id: str,
+    user_id: str | None,
+    model_id: str,
+    source: str,
+    resp_json: dict[str, Any] | None,
+    fallback_prompt: int,
+    fallback_completion: int,
+) -> None:
+    if not app.state.db.is_configured:
+        return
+    usage_repo: UsageRepository | None = getattr(app.state, "usage_repo", None)
+    if usage_repo is None:
+        return
+    p_tok, c_tok, t_tok = extract_usage_counts(
+        resp_json,
+        fallback_prompt=fallback_prompt,
+        fallback_completion=fallback_completion,
+    )
+    try:
+        await usage_repo.record_usage(
+            app_id=app_id,
+            user_id=user_id,
+            model_id=model_id,
+            source=source,
+            prompt_tokens=p_tok,
+            completion_tokens=c_tok,
+            total_tokens=t_tok,
+        )
+    except Exception as exc:
+        logger.warning("Failed to record %s token usage: %s", source, exc)
 
 
 async def _record_completed_turn(
@@ -217,12 +266,14 @@ def create_app(
         app.state.app_repo = AppRepository(db)
         app.state.session_repo = SessionRepository(db)
         app.state.memory_repo = MemoryRepository(db)
+        app.state.usage_repo = UsageRepository(db)
         app.state.embedder = EmbeddingClient(config, app.state.client)
         app.state.assembler = ContextAssembler(
             config,
             app.state.session_repo,
             app.state.memory_repo,
             app.state.embedder,
+            app.state.usage_repo,
         )
         app.state.worker = MemoryWorker(
             config,
@@ -230,6 +281,7 @@ def create_app(
             app.state.session_repo,
             app.state.memory_repo,
             app.state.embedder,
+            app.state.usage_repo,
         )
         app.state.worker.start()
 
@@ -264,6 +316,7 @@ def create_app(
     fastapi_app.include_router(apps_router)
     fastapi_app.include_router(sessions_router)
     fastapi_app.include_router(memories_router)
+    fastapi_app.include_router(usage_router)
 
     @fastapi_app.get("/", include_in_schema=False)
     async def root_redirect() -> RedirectResponse:
@@ -396,18 +449,38 @@ def create_app(
             finally:
                 worker.notify_inference_end()
 
-            if resp.status_code == 200 and assembled is not None:
+            if resp.status_code == 200:
+                body_json: dict[str, Any] | None = None
+                assistant_text = ""
                 try:
-                    body_json = resp.json()
-                    choices = body_json.get("choices") or []
-                    assistant_text = (
-                        (choices[0].get("message") or {}).get("content", "")
-                        if choices
-                        else ""
-                    )
+                    parsed = resp.json()
+                    if isinstance(parsed, dict):
+                        body_json = parsed
+                        choices = parsed.get("choices") or []
+                        assistant_text = (
+                            (choices[0].get("message") or {}).get("content", "")
+                            if choices
+                            else ""
+                        )
                 except Exception:
                     assistant_text = ""
-                if assistant_text:
+
+                fallback_prompt = (
+                    assembled.input_tokens
+                    if assembled is not None
+                    else estimate_messages_tokens(list(payload.get("messages") or []))
+                )
+                await _safe_record_usage(
+                    request.app,
+                    app_id=scope.app_id,
+                    user_id=scope.user_id,
+                    model_id=requested_id,
+                    source="chat",
+                    resp_json=body_json,
+                    fallback_prompt=fallback_prompt,
+                    fallback_completion=estimate_tokens(assistant_text),
+                )
+                if assembled is not None and assistant_text:
                     await _record_completed_turn(
                         request.app, scope, assembled, assistant_text, requested_id
                     )
@@ -432,15 +505,30 @@ def create_app(
         async def stream_body():
             try:
                 async for chunk in upstream_resp.aiter_bytes():
-                    if upstream_resp.status_code == 200 and assembled is not None:
+                    if upstream_resp.status_code == 200:
                         accumulator.feed(chunk)
                     yield chunk
             finally:
                 await upstream_resp.aclose()
                 worker.notify_inference_end()
-                if upstream_resp.status_code == 200 and assembled is not None:
+                if upstream_resp.status_code == 200:
                     full_reply = accumulator.finish()
-                    if full_reply:
+                    fallback_prompt = (
+                        assembled.input_tokens
+                        if assembled is not None
+                        else estimate_messages_tokens(list(payload.get("messages") or []))
+                    )
+                    await _safe_record_usage(
+                        request.app,
+                        app_id=scope.app_id,
+                        user_id=scope.user_id,
+                        model_id=requested_id,
+                        source="chat",
+                        resp_json={"usage": accumulator.usage} if accumulator.usage else None,
+                        fallback_prompt=fallback_prompt,
+                        fallback_completion=estimate_tokens(full_reply),
+                    )
+                    if assembled is not None and full_reply:
                         await _record_completed_turn(
                             request.app, scope, assembled, full_reply, requested_id
                         )
@@ -456,7 +544,9 @@ def create_app(
             },
         )
 
-    async def _proxy_simple(request: Request, upstream_path: str) -> Response:
+    async def _proxy_simple(
+        request: Request, upstream_path: str, source: str
+    ) -> Response:
         try:
             payload = await request.json()
         except Exception as exc:
@@ -467,7 +557,7 @@ def create_app(
         scope = await resolve_request_scope(request, payload, strip_router_fields=True)
         cfg: RouterConfig = request.app.state.config
         allowed_models = scope.app_settings.get("allowed_models")
-        target_url, _, _ = _resolve_model_or_agent(
+        target_url, requested_id, _ = _resolve_model_or_agent(
             cfg,
             payload,
             upstream_path,
@@ -478,6 +568,33 @@ def create_app(
             resp = await client.post(target_url, json=payload)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"Backend error: {exc}") from exc
+
+        if resp.status_code == 200:
+            body_json: dict[str, Any] | None = None
+            try:
+                parsed = resp.json()
+                if isinstance(parsed, dict):
+                    body_json = parsed
+            except Exception:
+                body_json = None
+            raw_input = payload.get("prompt") if source == "completion" else payload.get("input")
+            fallback_prompt = estimate_tokens(flatten_message_content(raw_input))
+            fallback_completion = 0
+            if source == "completion" and body_json:
+                choices = body_json.get("choices") or []
+                text = str(choices[0].get("text") or "") if choices else ""
+                fallback_completion = estimate_tokens(text)
+            await _safe_record_usage(
+                request.app,
+                app_id=scope.app_id,
+                user_id=scope.user_id,
+                model_id=requested_id,
+                source=source,
+                resp_json=body_json,
+                fallback_prompt=fallback_prompt,
+                fallback_completion=fallback_completion,
+            )
+
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -487,11 +604,11 @@ def create_app(
 
     @fastapi_app.post("/v1/completions")
     async def completions(request: Request) -> Response:
-        return await _proxy_simple(request, "/v1/completions")
+        return await _proxy_simple(request, "/v1/completions", "completion")
 
     @fastapi_app.post("/v1/embeddings")
     async def embeddings(request: Request) -> Response:
-        return await _proxy_simple(request, "/v1/embeddings")
+        return await _proxy_simple(request, "/v1/embeddings", "embedding")
 
     UI_DIR.mkdir(parents=True, exist_ok=True)
     fastapi_app.mount(

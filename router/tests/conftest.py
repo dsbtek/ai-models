@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import math
@@ -49,6 +49,143 @@ class FakeDBManager:
 
     async def close(self) -> None:
         pass
+
+
+class FakeUsageRepo:
+    def __init__(self) -> None:
+        self.records: dict[tuple[str, str, str, str, str], dict[str, int]] = {}
+
+    async def record_usage(
+        self,
+        *,
+        app_id: str,
+        user_id: str | None,
+        model_id: str,
+        source: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int | None = None,
+        usage_date: date | None = None,
+    ) -> None:
+        p_tok = max(0, int(prompt_tokens))
+        c_tok = max(0, int(completion_tokens))
+        t_tok = max(p_tok + c_tok, int(total_tokens)) if total_tokens is not None else p_tok + c_tok
+        if p_tok == 0 and c_tok == 0 and t_tok == 0:
+            return
+        d_str = (usage_date or datetime.now(timezone.utc).date()).isoformat()
+        key = (d_str, app_id, (user_id or "").strip(), model_id, source)
+        cur = self.records.setdefault(
+            key,
+            {"request_count": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )
+        cur["request_count"] += 1
+        cur["prompt_tokens"] += p_tok
+        cur["completion_tokens"] += c_tok
+        cur["total_tokens"] += t_tok
+
+    def _filtered(
+        self,
+        app_id: str,
+        user_id: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        model_id: str | None = None,
+        source: str | None = None,
+    ) -> list[tuple[tuple[str, str, str, str, str], dict[str, int]]]:
+        out = []
+        for k, v in self.records.items():
+            d_str, a_id, u_id, m_id, src = k
+            if a_id != app_id:
+                continue
+            if user_id is not None and u_id != user_id.strip():
+                continue
+            d_val = date.fromisoformat(d_str)
+            if start_date is not None and d_val < start_date:
+                continue
+            if end_date is not None and d_val > end_date:
+                continue
+            if model_id is not None and m_id != model_id:
+                continue
+            if source is not None and src != source:
+                continue
+            out.append((k, v))
+        return out
+
+    async def get_usage_summary(
+        self,
+        *,
+        app_id: str,
+        user_id: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        model_id: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        rows = self._filtered(app_id, user_id, start_date, end_date, model_id, source)
+        totals = {"request_count": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        by_model: dict[str, dict[str, int]] = {}
+        by_source: dict[str, dict[str, int]] = {}
+        by_day: dict[str, dict[str, int]] = {}
+        for (d_str, _, _, m_id, src), vals in rows:
+            for k in totals:
+                totals[k] += vals[k]
+            for bucket, b_key in ((by_model, m_id), (by_source, src), (by_day, d_str)):
+                b = bucket.setdefault(
+                    b_key,
+                    {"request_count": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                )
+                for k in b:
+                    b[k] += vals[k]
+        return {
+            "totals": totals,
+            "by_model": sorted(
+                [{"model_id": k, **v} for k, v in by_model.items()],
+                key=lambda x: x["total_tokens"],
+                reverse=True,
+            ),
+            "by_source": sorted(
+                [{"source": k, **v} for k, v in by_source.items()],
+                key=lambda x: x["total_tokens"],
+                reverse=True,
+            ),
+            "by_day": sorted(
+                [{"date": k, **v} for k, v in by_day.items()],
+                key=lambda x: x["date"],
+                reverse=True,
+            ),
+        }
+
+    async def list_user_usage(
+        self,
+        *,
+        app_id: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        rows = self._filtered(app_id, None, start_date, end_date, None, None)
+        by_user: dict[str, dict[str, Any]] = {}
+        for (d_str, _, u_id, _, _), vals in rows:
+            b = by_user.setdefault(
+                u_id,
+                {
+                    "user_id": u_id if u_id else None,
+                    "request_count": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "last_active_date": d_str,
+                },
+            )
+            b["request_count"] += vals["request_count"]
+            b["prompt_tokens"] += vals["prompt_tokens"]
+            b["completion_tokens"] += vals["completion_tokens"]
+            b["total_tokens"] += vals["total_tokens"]
+            if d_str > b["last_active_date"]:
+                b["last_active_date"] = d_str
+        ordered = sorted(by_user.values(), key=lambda x: x["total_tokens"], reverse=True)
+        return ordered[offset : offset + limit]
 
 
 class FakeAppRepo:
@@ -533,6 +670,7 @@ def build_test_app(auth_mode: str = "dev", admin_api_key: str = "") -> tuple[Any
     app_repo = FakeAppRepo()
     session_repo = FakeSessionRepo(app_repo.sessions_ref)
     memory_repo = FakeMemoryRepo(app_repo.memories_ref, app_repo.sessions_ref)
+    usage_repo = FakeUsageRepo()
 
     # Override repositories after lifespan starts via middleware-like startup hook
     orig_lifespan = fastapi_app.router.lifespan_context
@@ -549,13 +687,14 @@ def build_test_app(auth_mode: str = "dev", admin_api_key: str = "") -> tuple[Any
             a.state.app_repo = app_repo
             a.state.session_repo = session_repo
             a.state.memory_repo = memory_repo
+            a.state.usage_repo = usage_repo
             a.state.embedder = EmbeddingClient(cfg, mock_http)
             a.state.assembler = ContextAssembler(
-                cfg, session_repo, memory_repo, a.state.embedder
+                cfg, session_repo, memory_repo, a.state.embedder, usage_repo
             )
             await a.state.worker.stop()
             a.state.worker = MemoryWorker(
-                cfg, mock_http, session_repo, memory_repo, a.state.embedder
+                cfg, mock_http, session_repo, memory_repo, a.state.embedder, usage_repo
             )
             a.state.worker.start()
             yield
